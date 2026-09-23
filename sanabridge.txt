@@ -1,0 +1,16 @@
+SanaBridge/
+│
+├── SANABRIDGE_DRAFT.txt          ← уже сделали
+├── PRODUCT_SPEC.md               ← что именно строим
+├── AI_SPEC.md                    ← логика OpenAI + NVIDIA
+├── DEMO_SCENARIO.md              ← сценарий показа жюри
+├── TASKS.md                      ← P0 / P1 / P2
+│
+├── backend/
+│   └── .env.example              ← названия API variables
+│
+├── docs/
+│   └── architecture.md           ← схема системы
+│
+├── .gitignore                    ← обязательно
+└── README.md                     ← пока короткий, финальный создаст Codex
