@@ -1,0 +1,689 @@
+SanaBridge — HackAlem AI MVP Draft
+==================================
+
+Назначение
+----------
+SanaBridge превращает короткое и неполное описание бизнес-проблемы в структурированный AI Challenge:
+1) OpenAI извлекает известные факты и определяет пробелы.
+2) Система задаёт контекстные уточняющие вопросы.
+3) Backend детерминированно считает Readiness Score.
+4) Бизнес дополняет задачу и публикует её.
+5) Студенческие команды видят каталог и отправляют заявки.
+6) Бизнес выбирает команду.
+7) NVIDIA NIM опционально выполняет независимый технический review.
+
+ВАЖНО: этот TXT — черновой blueprint для Codex, а не готовое production-приложение.
+Никогда не публикуйте реальные API-ключи в GitHub.
+
+============================================================
+ПРЕДЛАГАЕМАЯ СТРУКТУРА
+============================================================
+
+sanabridge/
+├── backend/
+│   ├── app/
+│   │   ├── main.py
+│   │   ├── config.py
+│   │   ├── database.py
+│   │   ├── models.py
+│   │   ├── schemas.py
+│   │   ├── routes/
+│   │   │   ├── challenges.py
+│   │   │   └── applications.py
+│   │   └── services/
+│   │       ├── readiness.py
+│   │       ├── openai_service.py
+│   │       └── nvidia_service.py
+│   ├── tests/
+│   │   └── test_readiness.py
+│   ├── requirements.txt
+│   └── .env.example
+├── frontend/
+│   └── React + Vite
+├── .gitignore
+└── README.md
+
+============================================================
+backend/requirements.txt
+============================================================
+
+fastapi
+uvicorn[standard]
+sqlalchemy
+pydantic
+pydantic-settings
+python-dotenv
+openai
+httpx
+pytest
+
+============================================================
+backend/.env.example
+============================================================
+
+OPENAI_API_KEY=your_openai_api_key_here
+OPENAI_MODEL=your_supported_openai_model
+
+NVIDIA_API_KEY=your_nvidia_api_key_here
+NVIDIA_MODEL=your_supported_nvidia_model
+NVIDIA_BASE_URL=https://integrate.api.nvidia.com/v1
+
+DATABASE_URL=sqlite:///./sanabridge.db
+
+============================================================
+.gitignore
+============================================================
+
+.env
+.env.*
+!.env.example
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+node_modules/
+dist/
+*.db
+.DS_Store
+
+============================================================
+backend/app/config.py
+============================================================
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+class Settings(BaseSettings):
+    openai_api_key: str | None = None
+    openai_model: str | None = None
+    nvidia_api_key: str | None = None
+    nvidia_model: str | None = None
+    nvidia_base_url: str = "https://integrate.api.nvidia.com/v1"
+    database_url: str = "sqlite:///./sanabridge.db"
+
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+settings = Settings()
+
+============================================================
+backend/app/database.py
+============================================================
+
+from sqlalchemy import create_engine
+from sqlalchemy.orm import DeclarativeBase, sessionmaker
+from .config import settings
+
+connect_args = (
+    {"check_same_thread": False}
+    if settings.database_url.startswith("sqlite")
+    else {}
+)
+
+engine = create_engine(settings.database_url, connect_args=connect_args)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+class Base(DeclarativeBase):
+    pass
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+============================================================
+backend/app/models.py
+============================================================
+
+from datetime import datetime
+from sqlalchemy import DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+from .database import Base
+
+class Challenge(Base):
+    __tablename__ = "challenges"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    title: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    raw_description: Mapped[str] = mapped_column(Text)
+
+    problem: Mapped[str | None] = mapped_column(Text, nullable=True)
+    goal: Mapped[str | None] = mapped_column(Text, nullable=True)
+    target_users: Mapped[str | None] = mapped_column(Text, nullable=True)
+    available_data: Mapped[str | None] = mapped_column(Text, nullable=True)
+    expected_result: Mapped[str | None] = mapped_column(Text, nullable=True)
+    success_metrics: Mapped[str | None] = mapped_column(Text, nullable=True)
+    constraints: Mapped[str | None] = mapped_column(Text, nullable=True)
+    deadline: Mapped[str | None] = mapped_column(String(100), nullable=True)
+
+    required_skills: Mapped[str | None] = mapped_column(Text, nullable=True)
+    suggested_solution: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    readiness_score: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[str] = mapped_column(String(30), default="DRAFT")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    applications: Mapped[list["Application"]] = relationship(
+        back_populates="challenge",
+        cascade="all, delete-orphan",
+    )
+
+class Application(Base):
+    __tablename__ = "applications"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    challenge_id: Mapped[int] = mapped_column(ForeignKey("challenges.id"))
+    team_name: Mapped[str] = mapped_column(String(255))
+    members_count: Mapped[int] = mapped_column(Integer)
+    skills: Mapped[str] = mapped_column(Text)
+    github_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    motivation: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(30), default="PENDING")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    challenge: Mapped["Challenge"] = relationship(back_populates="applications")
+
+============================================================
+backend/app/schemas.py
+============================================================
+
+from pydantic import BaseModel, Field
+
+class ChallengeInput(BaseModel):
+    description: str = Field(min_length=10)
+
+class ClarificationQuestion(BaseModel):
+    field: str
+    question: str
+
+class ChallengeAnalysis(BaseModel):
+    title: str | None = None
+    problem: str | None = None
+    goal: str | None = None
+    target_users: str | None = None
+    available_data: str | None = None
+    expected_result: str | None = None
+    success_metrics: str | None = None
+    constraints: str | None = None
+    deadline: str | None = None
+    required_skills: list[str] = []
+    suggested_solution: str | None = None
+    missing_fields: list[str] = []
+    clarification_questions: list[ClarificationQuestion] = []
+
+class ClarificationRequest(BaseModel):
+    answers: dict[str, str]
+
+class ApplicationCreate(BaseModel):
+    team_name: str = Field(min_length=2)
+    members_count: int = Field(ge=1, le=100)
+    skills: list[str]
+    github_url: str | None = None
+    motivation: str = Field(min_length=5)
+
+============================================================
+backend/app/services/readiness.py
+============================================================
+
+FIELD_WEIGHTS = {
+    "problem": 15,
+    "goal": 15,
+    "target_users": 10,
+    "available_data": 15,
+    "expected_result": 15,
+    "success_metrics": 15,
+    "constraints": 5,
+    "deadline": 10,
+}
+
+def has_meaningful_value(value) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return len(value.strip()) >= 3
+    return bool(value)
+
+def calculate_readiness(challenge: dict) -> dict:
+    score = 0
+    completed = []
+    missing = []
+
+    for field, weight in FIELD_WEIGHTS.items():
+        if has_meaningful_value(challenge.get(field)):
+            score += weight
+            completed.append(field)
+        else:
+            missing.append(field)
+
+    return {
+        "score": min(score, 100),
+        "completed_fields": completed,
+        "missing_fields": missing,
+        "weights": FIELD_WEIGHTS,
+    }
+
+============================================================
+backend/app/services/openai_service.py
+============================================================
+
+# ВАЖНО ДЛЯ CODEX:
+# Проверь актуальный OpenAI SDK и реализуй Structured Outputs по текущей
+# официальной схеме SDK. Не полагайся на устаревшие примеры.
+
+SYSTEM_PROMPT = '''
+You are SanaBridge, an AI analyst that converts incomplete business
+problems into clear hackathon challenges.
+
+Extract only information supported by the business description.
+Never invent business facts. If information is unavailable, use null.
+
+Extract:
+- title
+- problem
+- goal
+- target_users
+- available_data
+- expected_result
+- success_metrics
+- constraints
+- deadline
+
+You MAY suggest:
+- required_skills
+- suggested_solution
+
+Clearly treat those as AI suggestions.
+
+Generate concise context-aware clarification questions for important
+missing fields. Do not overwhelm the user.
+'''
+
+# Expected structured result:
+#
+# {
+#   "title": "...",
+#   "problem": "...",
+#   "goal": null,
+#   "target_users": null,
+#   "available_data": "...",
+#   "expected_result": null,
+#   "success_metrics": null,
+#   "constraints": null,
+#   "deadline": null,
+#   "required_skills": ["Python", "NLP"],
+#   "suggested_solution": "...",
+#   "missing_fields": [...],
+#   "clarification_questions": [
+#       {"field": "target_users", "question": "..."}
+#   ]
+# }
+
+============================================================
+backend/app/services/nvidia_service.py
+============================================================
+
+# NVIDIA — ОПЦИОНАЛЬНЫЙ второй technical reviewer.
+# Он НЕ должен считать Readiness Score и НЕ должен ломать основной flow.
+#
+# Проверяет:
+# - technical inconsistencies
+# - feasibility concerns
+# - data readiness
+# - missing technical assumptions
+#
+# Expected result:
+#
+# {
+#   "technical_feasibility": "high|medium|low|unknown",
+#   "data_readiness": "high|medium|low|unknown",
+#   "risks": [],
+#   "technical_questions": [],
+#   "review_summary": ""
+# }
+#
+# Использовать NVIDIA NIM/OpenAI-compatible endpoint только после проверки
+# актуальной документации/API.
+# При отсутствии ключа/timeout/error вернуть:
+# {"available": false, "message": "Technical review unavailable"}
+
+============================================================
+backend/app/main.py — API DESIGN
+============================================================
+
+FastAPI application.
+
+Required endpoints:
+
+GET  /api/health
+POST /api/challenges/analyze
+POST /api/challenges
+GET  /api/challenges
+GET  /api/challenges/{id}
+POST /api/challenges/{id}/clarify
+POST /api/challenges/{id}/technical-review
+POST /api/challenges/{id}/publish
+POST /api/challenges/{id}/applications
+GET  /api/challenges/{id}/applications
+PATCH /api/applications/{id}/select
+
+Core rules:
+
+1. /analyze
+   - accepts raw description
+   - calls OpenAI
+   - returns structured analysis + deterministic readiness
+
+2. POST /challenges
+   - persists analyzed challenge
+   - status DRAFT/CLARIFYING/READY
+
+3. /clarify
+   - accepts answers by field
+   - updates only allowed challenge fields
+   - recalculates readiness
+
+4. /technical-review
+   - calls NVIDIA if configured
+   - failure must be graceful
+
+5. /publish
+   - MVP threshold: readiness >= 70
+   - changes status to PUBLISHED
+
+6. /applications
+   - only published challenges accept applications
+
+7. /select
+   - selected application -> SELECTED
+   - other applications for same challenge -> REJECTED
+   - persist result
+
+CORS development origin:
+http://localhost:5173
+
+============================================================
+backend/tests/test_readiness.py
+============================================================
+
+from app.services.readiness import calculate_readiness
+
+def test_empty_challenge_is_zero():
+    result = calculate_readiness({})
+    assert result["score"] == 0
+
+def test_complete_challenge_is_100():
+    challenge = {
+        "problem": "Manual feedback analysis is too slow.",
+        "goal": "Automate feedback analysis.",
+        "target_users": "University administration.",
+        "available_data": "10000 anonymized student reviews.",
+        "expected_result": "Dashboard and API.",
+        "success_metrics": "F1 score >= 0.85.",
+        "constraints": "No personal data.",
+        "deadline": "2026-11-30",
+    }
+    result = calculate_readiness(challenge)
+    assert result["score"] == 100
+    assert result["missing_fields"] == []
+
+def test_partial_challenge():
+    challenge = {
+        "problem": "Manual analysis is slow.",
+        "goal": "Automate analysis.",
+    }
+    result = calculate_readiness(challenge)
+    assert result["score"] == 30
+    assert "available_data" in result["missing_fields"]
+
+============================================================
+FRONTEND SPEC — React + Vite
+============================================================
+
+Pages:
+
+1. LandingPage
+   - SanaBridge
+   - "Turn problems into challenges. Connect ideas with talent."
+   - For Businesses
+   - For Student Teams
+
+2. CreateChallengePage
+   - textarea
+   - Analyze with AI
+   - loading/error states
+   - Readiness Score
+   - criteria status
+   - clarification questions
+   - submit answers
+   - structured preview
+   - optional NVIDIA review
+   - Publish
+
+3. CatalogPage
+   - only published challenges
+   - challenge cards
+   - readiness
+   - skills
+   - deadline
+
+4. ChallengeDetailsPage
+   - problem
+   - goal
+   - target users
+   - data
+   - deliverable
+   - metrics
+   - constraints
+   - deadline
+   - AI-suggested skills/solution clearly labelled
+   - Apply as Team
+
+5. BusinessApplicationsPage
+   - application cards
+   - team information
+   - Select Team button
+
+Reusable components:
+- Navbar
+- ChallengeCard
+- ReadinessScore
+- ReadinessCriteria
+- ClarificationForm
+- TechnicalReview
+- ApplicationForm
+- LoadingState
+- ErrorMessage
+
+Use a centralized frontend API client.
+
+Development backend:
+http://localhost:8000
+
+NEVER put OpenAI/NVIDIA secrets in frontend.
+
+============================================================
+DEMO SCENARIO
+============================================================
+
+Business enters:
+
+"Мы хотим использовать AI для анализа отзывов студентов."
+
+Expected flow:
+
+1. Analyze with AI.
+2. Show extracted facts.
+3. Keep unknown facts missing.
+4. Show actual readiness score.
+5. Generate context-aware questions.
+6. Business provides, for example:
+
+target_users:
+University administration and quality assurance staff
+
+available_data:
+10,000 anonymized student reviews in CSV format
+
+expected_result:
+Web dashboard and REST API
+
+success_metrics:
+F1 score >= 0.85 on validation data
+
+constraints:
+No personal student information may be exposed
+
+deadline:
+2026-11-30
+
+7. Recalculate readiness.
+8. Optionally run NVIDIA technical review.
+9. Publish.
+10. Open Student Catalog.
+11. Open challenge.
+12. Apply:
+
+Team name: Neural Nomads
+Members: 4
+Skills: Python, NLP, FastAPI, React
+GitHub: team repository URL
+Motivation: We have experience building NLP prototypes.
+
+13. Open Business Applications.
+14. Select Neural Nomads.
+15. Confirm SELECTED status persists.
+
+============================================================
+DEFINITION OF DONE
+============================================================
+
+P0 — REQUIRED
+
+[ ] vague business input
+[ ] OpenAI structured extraction
+[ ] no invented missing business facts
+[ ] adaptive clarification questions
+[ ] deterministic readiness score
+[ ] clarification updates challenge
+[ ] readiness recalculates
+[ ] structured challenge preview
+[ ] publish challenge
+[ ] challenge catalog
+[ ] challenge details
+[ ] student application
+[ ] business sees applications
+[ ] business selects one team
+[ ] SQLite persistence
+[ ] safe environment variables
+[ ] backend tests
+[ ] frontend build
+[ ] README reflects only implemented features
+
+P1
+
+[ ] NVIDIA technical review
+[ ] required skill suggestions
+[ ] suggested solution direction
+[ ] polished readiness visualization
+[ ] loading/error/empty states
+[ ] responsive UI
+
+P2
+
+[ ] team skill matching
+[ ] catalog filters
+[ ] deployment
+[ ] multilingual polish
+
+============================================================
+LOCAL RUN TARGET
+============================================================
+
+Backend:
+
+cd backend
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
+
+# Put REAL keys only into .env.
+# NEVER commit .env.
+
+uvicorn app.main:app --reload
+
+Swagger target:
+http://localhost:8000/docs
+
+Tests:
+
+cd backend
+source .venv/bin/activate
+pytest
+
+Frontend:
+
+cd frontend
+npm install
+npm run dev
+
+Typical Vite target:
+http://localhost:5173
+
+============================================================
+CODEX HANDOFF PROMPT
+============================================================
+
+Read SANABRIDGE_DRAFT.txt completely.
+
+Treat it as a product/architecture blueprint, NOT as blindly trusted
+production code.
+
+First inspect the current Git repository and preserve useful existing work.
+
+Then:
+
+1. Create/refine the real backend and frontend structure.
+2. Implement P0 before optional features.
+3. Use current supported package APIs.
+4. Implement OpenAI structured extraction using the current official SDK
+   and schema-constrained output where practical.
+5. Validate NVIDIA NIM integration against its current API before using it.
+6. Implement React + Vite frontend.
+7. Never hardcode or expose secrets.
+8. Add API validation and understandable errors.
+9. Run backend tests.
+10. Run frontend build.
+11. Fix failures.
+12. Verify the full P0 demo flow.
+13. Search repository for accidentally exposed secrets.
+14. Do not claim functionality or successful tests unless actually verified.
+
+Prefer a stable hackathon MVP over unnecessary architecture.
+
+When finished, report:
+
+IMPLEMENTED
+TESTED
+OPENAI INTEGRATION
+NVIDIA INTEGRATION
+HOW TO RUN
+DEMO STEPS
+KNOWN LIMITATIONS
+TOP 3 NEXT PRIORITIES
+
+============================================================
+SECURITY REMINDER
+============================================================
+
+Never commit:
+- OPENAI_API_KEY
+- NVIDIA_API_KEY
+- .env
+- any private credentials
+
+Commit only:
+.env.example
+
+Before final submission, inspect Git history/current tracked files for secrets.
